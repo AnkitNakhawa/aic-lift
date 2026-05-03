@@ -54,10 +54,9 @@ jobs:
           # Ensure python3-sdformat16 apt package is present (needed by sdformat_mjcf)
           docker exec aic_eval bash -c "apt-get install -y python3-sdformat16 python3-gz-math9 2>/dev/null || true"
 
-          # Bootstrap pip and install the package
+          # Copy the package directly into site-packages (no pip needed)
           docker exec aic_eval bash -c \
-            "python3 -m ensurepip --upgrade 2>/dev/null || true && \
-             python3 -m pip install /tmp/sdformat_mjcf --break-system-packages"
+            "cp -r /tmp/sdformat_mjcf/src/sdformat_mjcf \$(python3 -c 'import site; print(site.getsitepackages()[0])')"
 
           # Verify import works
           docker exec aic_eval python3 -c "import sdformat_mjcf; print('sdformat_mjcf OK')"
