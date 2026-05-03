@@ -54,12 +54,20 @@ jobs:
           # Ensure python3-sdformat16 apt package is present (needed by sdformat_mjcf)
           docker exec aic_eval bash -c "apt-get install -y python3-sdformat16 python3-gz-math9 2>/dev/null || true"
 
-          # Copy the package directly into site-packages (no pip needed)
+          # The aic branch setup.py requires __version__.py — create it so install succeeds
           docker exec aic_eval bash -c \
-            "cp -r /tmp/sdformat_mjcf/src/sdformat_mjcf \$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+            "echo '__version__ = \"0.0.1\"' > /tmp/sdformat_mjcf/src/sdformat_mjcf/__version__.py"
 
-          # Verify import works
-          docker exec aic_eval python3 -c "import sdformat_mjcf; print('sdformat_mjcf OK')"
+          # Install via setup.py so the sdf2mjcf entry-point script gets created
+          docker exec aic_eval bash -c \
+            "cd /tmp/sdformat_mjcf && python3 setup.py install 2>&1 | tail -10"
+
+          # Verify import and show what submodules are available
+          docker exec aic_eval python3 -c "
+import sdformat_mjcf, os
+pkg = os.path.dirname(sdformat_mjcf.__file__)
+print('sdformat_mjcf OK — submodules:', [f for f in sorted(os.listdir(pkg)) if f.endswith('.py')])
+"
 
       # ── SDF parser script ─────────────────────────────────────────────────
       - name: Copy SDF parser script into container
@@ -104,7 +112,7 @@ jobs:
           docker exec aic_eval bash -c \
             "mkdir -p /tmp/aic_mujoco_world && \
              source /ws_aic/install/setup.bash && \
-             python3 -c 'from sdformat_mjcf.sdformat_mjcf_cli import main; import sys; sys.argv=[\"sdf2mjcf\",\"/tmp/aic.sdf\",\"/tmp/aic_mujoco_world/aic_world.xml\"]; main()'"
+             sdf2mjcf /tmp/aic.sdf /tmp/aic_mujoco_world/aic_world.xml"
           docker exec aic_eval bash -c \
             "echo 'Files generated:' && \
              ls /tmp/aic_mujoco_world/ | wc -l && \
