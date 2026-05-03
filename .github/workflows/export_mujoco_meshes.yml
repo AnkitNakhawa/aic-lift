@@ -68,16 +68,10 @@ jobs:
       # ── Wait for the world to finish loading ──────────────────────────────
       - name: Wait for Gazebo world to load
         run: |
-          echo "Watching container logs for Gazebo ready signal..."
-          timeout 180 bash -c "
-            until docker logs aic_eval 2>&1 | \
-              grep -q 'Loaded world\|gz-server.*running\|Gazebo is running\|spawn_task_board'; do
-              sleep 5
-              echo 'still waiting...'
-            done
-          "
-          echo "Gazebo ready — sleeping 20s for full world init"
-          sleep 20
+          echo "Sleeping 90s for Gazebo to fully load on x86..."
+          sleep 90
+          echo "--- Last 30 lines of container log ---"
+          docker logs aic_eval 2>&1 | tail -30
 
       # ── Export SDF via gz service ─────────────────────────────────────────
       - name: Export world SDF from Gazebo
