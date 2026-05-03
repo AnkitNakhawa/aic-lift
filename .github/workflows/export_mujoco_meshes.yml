@@ -74,8 +74,11 @@ jobs:
       # ── Export SDF ────────────────────────────────────────────────────────
       - name: Export world SDF from Gazebo
         run: |
-          GZ=/opt/ros/kilted/opt/gz_tools_vendor/bin/gz
-          docker exec aic_eval $GZ world --world-name aic --export /tmp/aic.sdf
+          docker exec aic_eval bash -c "
+            source /opt/ros/kilted/setup.bash
+            source /ws_aic/install/setup.bash
+            gz world --world-name aic --export /tmp/aic.sdf
+          "
           docker exec aic_eval ls -lh /tmp/aic.sdf
 
       # ── Fix known SDF URI issues (documented in aic_utils/aic_mujoco/README) ─
