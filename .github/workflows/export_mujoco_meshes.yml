@@ -53,8 +53,8 @@ jobs:
             https://github.com/gazebosim/gz-mujoco.git /tmp/gz-mujoco
           docker cp /tmp/gz-mujoco/sdformat_mjcf aic_eval:/tmp/sdformat_mjcf
           docker exec aic_eval bash -c "
-            pip3 install /tmp/sdformat_mjcf --break-system-packages 2>/dev/null || \
-            pip3 install /tmp/sdformat_mjcf
+            apt-get install -y python3-pip --quiet 2>/dev/null || true
+            python3 -m pip install /tmp/sdformat_mjcf --break-system-packages
           "
 
       # ── Wait for the world to finish loading ──────────────────────────────
