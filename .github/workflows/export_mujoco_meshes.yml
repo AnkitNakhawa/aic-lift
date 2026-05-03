@@ -63,23 +63,8 @@ jobs:
           docker exec aic_eval python3 -c "import sdformat_mjcf; print('sdformat_mjcf OK')"
 
       # ── SDF parser script ─────────────────────────────────────────────────
-      # Written to host first (no indentation issues), then copied in.
-      - name: Write and copy SDF parser script
-        run: |
-          cat > /tmp/parse_sdf.py << 'PYEOF'
-import sys, re
-data = sys.stdin.read()
-# gz service returns: data: "<?xml ...>"  (proto text format)
-m = re.search(r'data:\s*"(.*)', data, re.DOTALL)
-if m:
-    sdf = m.group(1).encode().decode('unicode_escape').rstrip('"')
-    open('/tmp/aic.sdf', 'w').write(sdf)
-    print('SDF written, bytes:', len(sdf))
-else:
-    open('/tmp/aic.sdf', 'w').write(data)
-    print('Fallback write, bytes:', len(data))
-PYEOF
-          docker cp /tmp/parse_sdf.py aic_eval:/tmp/parse_sdf.py
+      - name: Copy SDF parser script into container
+        run: docker cp .github/scripts/parse_sdf.py aic_eval:/tmp/parse_sdf.py
 
       # ── Wait for the world to finish loading ──────────────────────────────
       - name: Wait for Gazebo world to load
