@@ -61,16 +61,15 @@ jobs:
       # ── Wait for the world to finish loading ──────────────────────────────
       - name: Wait for Gazebo world to load
         run: |
-          GZ=/opt/ros/kilted/opt/gz_tools_vendor/bin/gz
-          echo "Polling until Gazebo world 'aic' is visible..."
+          echo "Waiting for Gazebo to finish loading (watching container logs)..."
           timeout 180 bash -c "
-            until docker exec aic_eval \$GZ world --list 2>/dev/null | grep -q aic; do
+            until docker logs aic_eval 2>&1 | grep -q 'Loaded world\|gz-server.*running\|aic.*loaded\|Gazebo is running\|spawn_task_board'; do
               sleep 5
               echo 'still waiting...'
             done
           "
-          echo "World loaded — waiting 10s for full init"
-          sleep 10
+          echo "Gazebo ready — sleeping 20s for full world init"
+          sleep 20
 
       # ── Export SDF ────────────────────────────────────────────────────────
       - name: Export world SDF from Gazebo
