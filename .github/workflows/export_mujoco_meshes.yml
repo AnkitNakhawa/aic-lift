@@ -55,7 +55,7 @@ jobs:
           docker exec aic_eval bash -c "
             python3 -m ensurepip --upgrade 2>/dev/null || true
             python3 -m pip install /tmp/sdformat_mjcf --break-system-packages 2>/dev/null || \
-            python3 /tmp/sdformat_mjcf/setup.py install
+            cd /tmp/sdformat_mjcf && python3 setup.py install
           "
 
       # ── Wait for the world to finish loading ──────────────────────────────
