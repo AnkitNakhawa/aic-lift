@@ -51,8 +51,9 @@ jobs:
             https://github.com/gazebosim/gz-mujoco.git /tmp/gz-mujoco
           docker cp /tmp/gz-mujoco/sdformat_mjcf aic_eval:/tmp/sdformat_mjcf
 
-          # Ensure python3-sdformat16 apt package is present (needed by sdformat_mjcf)
-          docker exec aic_eval bash -c "apt-get install -y python3-sdformat16 python3-gz-math9 2>/dev/null || true"
+          # Refresh apt lists and install sdformat Python bindings (needed by sdformat_mjcf)
+          docker exec aic_eval bash -c "apt-get update -q && apt-get install -y python3-sdformat16 python3-gz-math9"
+          docker exec aic_eval python3 -c "import sdformat; print('sdformat OK:', sdformat.__file__)"
 
           # The aic branch setup.py requires __version__.py — create it so install succeeds
           docker exec aic_eval bash -c \
