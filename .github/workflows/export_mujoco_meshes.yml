@@ -1,7 +1,7 @@
 name: Export MuJoCo Mesh Assets
 
 # Run manually from the Actions tab whenever you need fresh mesh assets.
-# Downloads a zip of all .stl / .obj / .png files into aic_utils/aic_mujoco/mjcf/.
+# Downloads a zip of all .stl / .obj / .png files for aic_utils/aic_mujoco/mjcf/.
 
 on:
   workflow_dispatch:
@@ -45,25 +45,40 @@ jobs:
             "gazebo_gui:=false"
 
       # ── Install sdformat_mjcf inside the container ────────────────────────
-      # The container already has python3-sdformat16 (part of gz-sim9 deps).
-      # We only need to install the sdformat_mjcf Python package on top.
       - name: Install sdformat_mjcf in container
         run: |
           git clone --depth 1 -b aic \
             https://github.com/gazebosim/gz-mujoco.git /tmp/gz-mujoco
           docker cp /tmp/gz-mujoco/sdformat_mjcf aic_eval:/tmp/sdformat_mjcf
-          docker exec aic_eval bash -c "
-            python3 -m ensurepip --upgrade 2>/dev/null || true
-            python3 -m pip install /tmp/sdformat_mjcf --break-system-packages 2>/dev/null || \
-            cd /tmp/sdformat_mjcf && python3 setup.py install
-          "
+          docker exec aic_eval bash -c \
+            "python3 -m ensurepip --upgrade 2>/dev/null || true && \
+             python3 -m pip install /tmp/sdformat_mjcf --break-system-packages 2>/dev/null || \
+             (cd /tmp/sdformat_mjcf && python3 setup.py install)"
+
+      # ── SDF parser script (written to host, copied into container) ────────
+      - name: Write SDF parser script
+        run: |
+          cat > /tmp/parse_sdf.py << 'PYEOF'
+          import sys, re
+          data = sys.stdin.read()
+          m = re.search(r'data:\s*"(.*)', data, re.DOTALL)
+          if m:
+              sdf = m.group(1).encode().decode('unicode_escape').rstrip('"')
+              open('/tmp/aic.sdf', 'w').write(sdf)
+              print('SDF written, bytes:', len(sdf))
+          else:
+              open('/tmp/aic.sdf', 'w').write(data)
+              print('Fallback write, bytes:', len(data))
+          PYEOF
+          docker cp /tmp/parse_sdf.py aic_eval:/tmp/parse_sdf.py
 
       # ── Wait for the world to finish loading ──────────────────────────────
       - name: Wait for Gazebo world to load
         run: |
-          echo "Waiting for Gazebo to finish loading (watching container logs)..."
+          echo "Watching container logs for Gazebo ready signal..."
           timeout 180 bash -c "
-            until docker logs aic_eval 2>&1 | grep -q 'Loaded world\|gz-server.*running\|aic.*loaded\|Gazebo is running\|spawn_task_board'; do
+            until docker logs aic_eval 2>&1 | \
+              grep -q 'Loaded world\|gz-server.*running\|Gazebo is running\|spawn_task_board'; do
               sleep 5
               echo 'still waiting...'
             done
@@ -71,73 +86,50 @@ jobs:
           echo "Gazebo ready — sleeping 20s for full world init"
           sleep 20
 
-      # ── Export SDF ────────────────────────────────────────────────────────
+      # ── Export SDF via gz service ─────────────────────────────────────────
       - name: Export world SDF from Gazebo
         run: |
-          docker exec aic_eval bash -c "
-            source /opt/ros/kilted/setup.bash
-            source /ws_aic/install/setup.bash
-            gz service \
-              -s /world/aic/generate_world_sdf \
-              --reqtype gz.msgs.WorldGeneratorParams \
-              --reptype gz.msgs.StringMsg \
-              --timeout 30000 \
-              --req 'save_fuel_world: false' \
-            | python3 -c \"
-import sys, re
-data = sys.stdin.read()
-m = re.search(r'data:\s*\\\"(.*)', data, re.DOTALL)
-if m:
-    sdf = m.group(1).encode().decode('unicode_escape').rstrip('\\\"')
-    open('/tmp/aic.sdf', 'w').write(sdf)
-    print('SDF written, size:', len(sdf))
-else:
-    # fallback: entire response might be the SDF
-    open('/tmp/aic.sdf', 'w').write(data)
-    print('Fallback write, size:', len(data))
-\"
-          "
+          docker exec aic_eval bash -c \
+            "source /opt/ros/kilted/setup.bash && \
+             source /ws_aic/install/setup.bash && \
+             gz service \
+               -s /world/aic/generate_world_sdf \
+               --reqtype gz.msgs.WorldGeneratorParams \
+               --reptype gz.msgs.StringMsg \
+               --timeout 30000 \
+               --req 'save_fuel_world: false' \
+             | python3 /tmp/parse_sdf.py"
           docker exec aic_eval ls -lh /tmp/aic.sdf
 
-      # ── Fix known SDF URI issues (documented in aic_utils/aic_mujoco/README) ─
+      # ── Fix known SDF URI issues ──────────────────────────────────────────
       - name: Fix SDF URI issues
         run: |
-          ASSETS=/ws_aic/install/share/aic_assets/models
-          docker exec aic_eval bash -c "
-            # Fix 1: <urdf-string> leaking into mesh file URIs
-            sed -i 's|file://<urdf-string>/model://|file:///|g' /tmp/aic.sdf
-
-            # Fix 2: broken relative URIs for models spawned from URDF strings
-            sed -i \"s|file:///sc_plug_visual|file://${ASSETS}/SC Plug/sc_plug_visual|g\"    /tmp/aic.sdf
-            sed -i \"s|file:///lc_plug_visual|file://${ASSETS}/LC Plug/lc_plug_visual|g\"    /tmp/aic.sdf
-            sed -i \"s|file:///sfp_module_visual|file://${ASSETS}/SFP Module/sfp_module_visual|g\" /tmp/aic.sdf
-          "
+          docker exec aic_eval bash -c \
+            "sed -i 's|file://<urdf-string>/model://|file:///|g' /tmp/aic.sdf && \
+             ASSETS=/ws_aic/install/share/aic_assets/models && \
+             sed -i \"s|file:///sc_plug_visual|file://\${ASSETS}/SC Plug/sc_plug_visual|g\" /tmp/aic.sdf && \
+             sed -i \"s|file:///lc_plug_visual|file://\${ASSETS}/LC Plug/lc_plug_visual|g\" /tmp/aic.sdf && \
+             sed -i \"s|file:///sfp_module_visual|file://\${ASSETS}/SFP Module/sfp_module_visual|g\" /tmp/aic.sdf"
 
       # ── Convert SDF → MJCF + mesh assets ─────────────────────────────────
       - name: Convert SDF to MJCF
         run: |
-          docker exec aic_eval bash -c "
-            mkdir -p /tmp/aic_mujoco_world
-            source /ws_aic/install/setup.bash
-            sdf2mjcf /tmp/aic.sdf /tmp/aic_mujoco_world/aic_world.xml
-          "
-          docker exec aic_eval bash -c "
-            echo 'Files generated:'
-            ls /tmp/aic_mujoco_world/ | wc -l
-            ls /tmp/aic_mujoco_world/ | head -20
-          "
+          docker exec aic_eval bash -c \
+            "mkdir -p /tmp/aic_mujoco_world && \
+             source /ws_aic/install/setup.bash && \
+             sdf2mjcf /tmp/aic.sdf /tmp/aic_mujoco_world/aic_world.xml"
+          docker exec aic_eval bash -c \
+            "echo 'Files generated:' && ls /tmp/aic_mujoco_world/ | wc -l && \
+             ls /tmp/aic_mujoco_world/ | head -20"
 
-      # ── Copy assets out and package ───────────────────────────────────────
+      # ── Package and upload ────────────────────────────────────────────────
       - name: Package mesh assets
         run: |
           docker cp aic_eval:/tmp/aic_mujoco_world /tmp/aic_mujoco_world
           cd /tmp/aic_mujoco_world
-          # Exclude XML — we already have the processed versions in the repo
           zip -r /tmp/mujoco_mesh_assets.zip . --exclude "*.xml"
           ls -lh /tmp/mujoco_mesh_assets.zip
-          echo "Asset count: $(unzip -l /tmp/mujoco_mesh_assets.zip | tail -1)"
 
-      # ── Upload artifact ───────────────────────────────────────────────────
       - uses: actions/upload-artifact@v4
         with:
           name: mujoco-mesh-assets
