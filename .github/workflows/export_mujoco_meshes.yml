@@ -93,6 +93,7 @@ jobs:
                --req '{save_fuel_world: false}' \
              | python3 /tmp/parse_sdf.py"
           docker exec aic_eval ls -lh /tmp/aic.sdf
+          docker exec aic_eval head -c 300 /tmp/aic.sdf
 
       # ── Fix known SDF URI issues ──────────────────────────────────────────
       - name: Fix SDF URI issues
