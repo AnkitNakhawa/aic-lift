@@ -90,7 +90,7 @@ jobs:
                --reqtype gz.msgs.WorldGeneratorParams \
                --reptype gz.msgs.StringMsg \
                --timeout 30000 \
-               --req 'save_fuel_world: false' \
+               --req '' \
              | python3 /tmp/parse_sdf.py"
           docker exec aic_eval ls -lh /tmp/aic.sdf
           docker exec aic_eval head -c 300 /tmp/aic.sdf
