@@ -62,8 +62,9 @@ jobs:
           docker exec aic_eval bash -c \
             "cd /tmp/sdformat_mjcf && python3 setup.py install 2>&1 | tail -10"
 
-          # Verify import and list submodules so we can see what's available
-          docker exec aic_eval python3 -c "import sdformat_mjcf, os; pkg=os.path.dirname(sdformat_mjcf.__file__); print('OK submodules:', [f for f in sorted(os.listdir(pkg)) if f.endswith('.py')])"
+          # Verify install succeeded and sdf2mjcf CLI is on PATH
+          docker exec aic_eval python3 -c "import sdformat_mjcf; print('sdformat_mjcf OK')"
+          docker exec aic_eval which sdf2mjcf
 
       # ── SDF parser script ─────────────────────────────────────────────────
       - name: Copy SDF parser script into container
