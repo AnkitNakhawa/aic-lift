@@ -108,6 +108,7 @@ jobs:
         run: |
           docker exec aic_eval bash -c \
             "mkdir -p /tmp/aic_mujoco_world && \
+             source /opt/ros/kilted/setup.bash && \
              source /ws_aic/install/setup.bash && \
              PATH=/usr/local/bin:\$PATH sdf2mjcf /tmp/aic.sdf /tmp/aic_mujoco_world/aic_world.xml"
           docker exec aic_eval bash -c \
