@@ -199,7 +199,159 @@ The policy runs three phases in sequence: **Orient → Center (P1) → Insert (P
 
 ---
 
-## Quick Reference
+## Gazebo-Based Training (No MuJoCo Required)
+
+The `train-gz-p1` / `train-gz-p2` subcommands train the same SAC architecture
+directly inside the running Gazebo simulation rather than in MuJoCo.  This is
+useful when:
+
+- You want to skip the MuJoCo dependency entirely
+- You want to train on the exact same physics and sensors used at evaluation
+- You are on a platform where MuJoCo is unavailable
+
+**Trade-offs vs. MuJoCo training:**
+
+| | MuJoCo | Gazebo |
+|---|---|---|
+| Sim speed | 50–200× real-time | 1× real-time |
+| Docker needed during training | No | Yes |
+| Fidelity to eval sensors | Approximate | Exact |
+| Episode reset cost | Instant | ~4 s robot move |
+| `scene.xml` required | Yes | No |
+
+Because Gazebo runs at real-time speed, reduce `--total_steps` by roughly 10×
+compared to the MuJoCo defaults, or run overnight with a larger budget.
+
+### Stage 0 — Machine Setup
+
+Same as the MuJoCo workflow (`setup_cloud.sh`).
+
+### Stage 1 — Terminal 1: Start the eval container
+
+```bash
+# ground_truth:=true is required so TF port poses are available for reward
+./scripts/start_eval.sh ground_truth:=true start_aic_engine:=false gazebo_gui:=false
+```
+
+Leave this running for the entire training session.
+
+### Stage 2 — Terminal 2: Train Phase 1 (XY centering)
+
+**`run_local_precision.sh train-gz-p1`**
+
+```bash
+./scripts/run_local_precision.sh train-gz-p1 \
+    --port_type sfp \
+    --port_frame task_board/nic_card_mount_0/sfp_port_0_link \
+    --total_steps 100000 \
+    --save_dir checkpoints/gazebo/phase1
+```
+
+> **`--port_frame`** must match the TF frame of the port you are training on.
+> Inspect the available frames with `pixi run ros2 run tf2_tools view_frames` while
+> the eval container is running with `ground_truth:=true`.
+
+**What to watch:**
+
+| Signal | Target |
+|---|---|
+| `xy_err` | < 0.004 m by step ~30 k |
+| `reward` | Trending toward 0 |
+
+### Stage 3 — Terminal 2: Train Phase 2 (F/T insertion)
+
+**`run_local_precision.sh train-gz-p2`**
+
+```bash
+./scripts/run_local_precision.sh train-gz-p2 \
+    --port_type sfp \
+    --port_frame task_board/nic_card_mount_0/sfp_port_0_link \
+    --total_steps 100000 \
+    --save_dir checkpoints/gazebo/phase2
+```
+
+> Run Phase 1 first. Phase 2 assumes the plug starts centered above the port.
+
+**What to watch:**
+
+| Signal | Target |
+|---|---|
+| `depth` | > 0.015 m |
+| `ft_mag` | < 10 N |
+| `reward` | > +40 |
+
+**To resume a crashed Gazebo run:**
+
+```bash
+./scripts/run_local_precision.sh train-gz-p1 \
+    --port_frame task_board/nic_card_mount_0/sfp_port_0_link \
+    --load checkpoints/gazebo/phase1/step_50000.pt
+```
+
+**To run both phases overnight:**
+
+```bash
+mkdir -p logs
+nohup bash -c '
+  ./scripts/run_local_precision.sh train-gz-p1 \
+      --port_frame task_board/nic_card_mount_0/sfp_port_0_link \
+      --save_dir checkpoints/gazebo/phase1 \
+  && \
+  ./scripts/run_local_precision.sh train-gz-p2 \
+      --port_frame task_board/nic_card_mount_0/sfp_port_0_link \
+      --save_dir checkpoints/gazebo/phase2
+' > logs/overnight_gz_train.log 2>&1 &
+echo "Training PID: $!"
+tail -f logs/overnight_gz_train.log
+```
+
+### Stage 4 — Deploy with Gazebo-trained checkpoints
+
+**Terminal 1** — keep the eval container running (or restart without ground_truth):
+
+```bash
+./scripts/start_eval.sh
+```
+
+**Terminal 2** — deploy `LocalPrecisionGazeboPolicy`:
+
+```bash
+./scripts/run_local_precision.sh deploy-gz \
+    --p1-ckpt checkpoints/gazebo/phase1/final.pt \
+    --p2-ckpt checkpoints/gazebo/phase2/final.pt
+```
+
+Or via `run_policy.sh` with env vars:
+
+```bash
+export AIC_GZ_PHASE1_CKPT=checkpoints/gazebo/phase1/final.pt
+export AIC_GZ_PHASE2_CKPT=checkpoints/gazebo/phase2/final.pt
+./scripts/run_policy.sh aic_example_policies.ros.LocalPrecisionGazeboPolicy
+```
+
+### Gazebo Full Run — Recommended Order
+
+```
+1.  ./scripts/setup_cloud.sh                   ← once per machine
+2.  source ~/.bashrc
+3.  start_eval.sh ground_truth:=true …         ← Terminal 1, keep running
+4.  run_local_precision.sh train-gz-p1         ← Terminal 2, overnight if needed
+5.  run_local_precision.sh train-gz-p2         ← Terminal 2, after Phase 1 converges
+6.  start_eval.sh                              ← Terminal 1, restart without ground_truth
+7.  run_local_precision.sh deploy-gz           ← Terminal 2
+```
+
+### Gazebo Quick Reference
+
+| Subcommand | Eval container needed? | ground_truth? | Checkpoint needed? |
+|---|---|---|---|
+| `train-gz-p1` | Yes | Yes | No (or `--load`) |
+| `train-gz-p2` | Yes | Yes | No (or `--load`) |
+| `deploy-gz` | Yes | No | Yes |
+
+---
+
+## Quick Reference (MuJoCo)
 
 | Script | Docker needed? | `scene.xml` needed? | Checkpoint needed? |
 |---|---|---|---|

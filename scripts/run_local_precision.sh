@@ -2,16 +2,24 @@
 # Unified runner for LocalPrecisionPolicy: train, test, and deploy.
 #
 # Subcommands:
-#   train-p1   Train Phase 1 (XY centering) SAC policy in MuJoCo sim
-#   train-p2   Train Phase 2 (F/T insertion) SAC policy in MuJoCo sim
-#   test       Run a quick headless rollout and print per-step stats
-#   deploy     Run LocalPrecisionPolicy against the live eval environment
+#   train-p1      Train Phase 1 (XY centering) SAC policy in MuJoCo sim
+#   train-p2      Train Phase 2 (F/T insertion) SAC policy in MuJoCo sim
+#   test          Run a quick headless rollout and print per-step stats
+#   deploy        Run LocalPrecisionPolicy against the live eval environment
+#   train-gz-p1   Train Phase 1 in the live Gazebo sim (eval container must be running)
+#   train-gz-p2   Train Phase 2 in the live Gazebo sim (eval container must be running)
+#   deploy-gz     Run LocalPrecisionGazeboPolicy with Gazebo-trained checkpoints
 #
-# Usage:
+# MuJoCo usage (no Docker needed):
 #   ./scripts/run_local_precision.sh train-p1 --scene /path/to/scene.xml [opts]
 #   ./scripts/run_local_precision.sh train-p2 --scene /path/to/scene.xml [opts]
 #   ./scripts/run_local_precision.sh test  --scene /path/to/scene.xml [--phase 1|2] [--ckpt /path/to/ckpt.pt]
 #   ./scripts/run_local_precision.sh deploy [--p1-ckpt /path] [--p2-ckpt /path]
+#
+# Gazebo usage (eval container must be running via start_eval.sh):
+#   ./scripts/run_local_precision.sh train-gz-p1 [--port_frame <tf_frame>] [--port_type sfp|sc] [opts]
+#   ./scripts/run_local_precision.sh train-gz-p2 [--port_frame <tf_frame>] [--port_type sfp|sc] [opts]
+#   ./scripts/run_local_precision.sh deploy-gz [--p1-ckpt /path] [--p2-ckpt /path]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -330,6 +338,122 @@ cmd_deploy() {
         -p policy:="aic_example_policies.ros.LocalPrecisionPolicy"
 }
 
+# ── Gazebo subcommands ────────────────────────────────────────────────────────
+
+cmd_train_gz_p1() {
+    PORT_TYPE="$DEFAULT_PORT_TYPE"
+    PORT_FRAME="task_board/nic_card_mount_0/sfp_port_0_link"
+    TOTAL_STEPS=100000
+    BUFFER_SIZE=20000
+    SAVE_DIR="$REPO_ROOT/checkpoints/gazebo/phase1"
+    LOAD=""
+    DET_WEIGHT=0.1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port_type)      PORT_TYPE="$2";    shift 2 ;;
+            --port_frame)     PORT_FRAME="$2";   shift 2 ;;
+            --total_steps)    TOTAL_STEPS="$2";  shift 2 ;;
+            --buffer_size)    BUFFER_SIZE="$2";  shift 2 ;;
+            --save_dir)       SAVE_DIR="$2";     shift 2 ;;
+            --load)           LOAD="$2";         shift 2 ;;
+            --det_loss_weight) DET_WEIGHT="$2";  shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    mkdir -p "$SAVE_DIR"
+    echo "[train-gz-p1] Port type:   $PORT_TYPE"
+    echo "[train-gz-p1] Port frame:  $PORT_FRAME"
+    echo "[train-gz-p1] Steps:       $TOTAL_STEPS"
+    echo "[train-gz-p1] Save dir:    $SAVE_DIR"
+    echo "[train-gz-p1] Make sure the eval container is running with ground_truth:=true"
+    [[ -n "$LOAD" ]] && echo "[train-gz-p1] Resuming:    $LOAD"
+    echo ""
+
+    cd "$REPO_ROOT"
+    pixi run python -m aic_example_policies.training.train_centering_gz \
+        --port_type    "$PORT_TYPE" \
+        --port_frame   "$PORT_FRAME" \
+        --total_steps  "$TOTAL_STEPS" \
+        --buffer_size  "$BUFFER_SIZE" \
+        --save_dir     "$SAVE_DIR" \
+        --det_loss_weight "$DET_WEIGHT" \
+        ${LOAD:+--load "$LOAD"}
+}
+
+cmd_train_gz_p2() {
+    PORT_TYPE="$DEFAULT_PORT_TYPE"
+    PORT_FRAME="task_board/nic_card_mount_0/sfp_port_0_link"
+    TOTAL_STEPS=100000
+    BUFFER_SIZE=10000
+    SAVE_DIR="$REPO_ROOT/checkpoints/gazebo/phase2"
+    LOAD=""
+    DET_WEIGHT=0.1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port_type)      PORT_TYPE="$2";    shift 2 ;;
+            --port_frame)     PORT_FRAME="$2";   shift 2 ;;
+            --total_steps)    TOTAL_STEPS="$2";  shift 2 ;;
+            --buffer_size)    BUFFER_SIZE="$2";  shift 2 ;;
+            --save_dir)       SAVE_DIR="$2";     shift 2 ;;
+            --load)           LOAD="$2";         shift 2 ;;
+            --det_loss_weight) DET_WEIGHT="$2";  shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    mkdir -p "$SAVE_DIR"
+    echo "[train-gz-p2] Port type:   $PORT_TYPE"
+    echo "[train-gz-p2] Port frame:  $PORT_FRAME"
+    echo "[train-gz-p2] Steps:       $TOTAL_STEPS"
+    echo "[train-gz-p2] Save dir:    $SAVE_DIR"
+    echo "[train-gz-p2] Make sure the eval container is running with ground_truth:=true"
+    [[ -n "$LOAD" ]] && echo "[train-gz-p2] Resuming:    $LOAD"
+    echo ""
+
+    cd "$REPO_ROOT"
+    pixi run python -m aic_example_policies.training.train_insertion_gz \
+        --port_type    "$PORT_TYPE" \
+        --port_frame   "$PORT_FRAME" \
+        --total_steps  "$TOTAL_STEPS" \
+        --buffer_size  "$BUFFER_SIZE" \
+        --save_dir     "$SAVE_DIR" \
+        --det_loss_weight "$DET_WEIGHT" \
+        ${LOAD:+--load "$LOAD"}
+}
+
+cmd_deploy_gz() {
+    P1_CKPT="$REPO_ROOT/checkpoints/gazebo/phase1/final.pt"
+    P2_CKPT="$REPO_ROOT/checkpoints/gazebo/phase2/final.pt"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --p1-ckpt) P1_CKPT="$2"; shift 2 ;;
+            --p2-ckpt) P2_CKPT="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -f "$P1_CKPT" ]] || echo "[warn] Gazebo Phase 1 checkpoint not found: $P1_CKPT"
+    [[ -f "$P2_CKPT" ]] || echo "[warn] Gazebo Phase 2 checkpoint not found: $P2_CKPT"
+
+    export AIC_GZ_PHASE1_CKPT="$P1_CKPT"
+    export AIC_GZ_PHASE2_CKPT="$P2_CKPT"
+
+    echo "[deploy-gz] Phase 1 ckpt: $P1_CKPT"
+    echo "[deploy-gz] Phase 2 ckpt: $P2_CKPT"
+    echo "[deploy-gz] Starting LocalPrecisionGazeboPolicy..."
+    echo ""
+
+    cd "$REPO_ROOT"
+    pixi run ros2 run aic_model aic_model \
+        --ros-args \
+        -p use_sim_time:=true \
+        -p policy:="aic_example_policies.ros.LocalPrecisionGazeboPolicy"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
 [[ $# -lt 1 ]] && usage
@@ -337,9 +461,12 @@ cmd_deploy() {
 SUBCMD="$1"; shift
 
 case "$SUBCMD" in
-    train-p1) cmd_train_p1 "$@" ;;
-    train-p2) cmd_train_p2 "$@" ;;
-    test)     cmd_test     "$@" ;;
-    deploy)   cmd_deploy   "$@" ;;
-    *)        die "Unknown subcommand: $SUBCMD. Expected: train-p1 | train-p2 | test | deploy" ;;
+    train-p1)    cmd_train_p1    "$@" ;;
+    train-p2)    cmd_train_p2    "$@" ;;
+    test)        cmd_test        "$@" ;;
+    deploy)      cmd_deploy      "$@" ;;
+    train-gz-p1) cmd_train_gz_p1 "$@" ;;
+    train-gz-p2) cmd_train_gz_p2 "$@" ;;
+    deploy-gz)   cmd_deploy_gz   "$@" ;;
+    *)        die "Unknown subcommand: $SUBCMD. Expected: train-p1 | train-p2 | test | deploy | train-gz-p1 | train-gz-p2 | deploy-gz" ;;
 esac

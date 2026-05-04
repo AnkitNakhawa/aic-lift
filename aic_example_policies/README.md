@@ -82,6 +82,39 @@ pixi run ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy
 
 ---
 
+---
+
+### 4. LocalPrecisionGazeboPolicy — Gazebo-Trained SAC
+
+Identical to `LocalPrecisionPolicy` in architecture and deployment, but loads checkpoints trained directly inside the Gazebo simulation rather than MuJoCo. Use this when you trained with `train-gz-p1` / `train-gz-p2`.
+
+**Purpose:** Two-phase SAC insertion policy trained without MuJoCo, using the same physics and sensors as official evaluation.
+
+**Prerequisites:** Train Phase 1 and Phase 2 using the Gazebo training workflow:
+
+```bash
+# Terminal 1
+./scripts/start_eval.sh ground_truth:=true start_aic_engine:=false gazebo_gui:=false
+
+# Terminal 2
+./scripts/run_local_precision.sh train-gz-p1 --port_frame task_board/nic_card_mount_0/sfp_port_0_link
+./scripts/run_local_precision.sh train-gz-p2 --port_frame task_board/nic_card_mount_0/sfp_port_0_link
+```
+
+**Deploy:**
+
+```bash
+./scripts/run_local_precision.sh deploy-gz \
+    --p1-ckpt checkpoints/gazebo/phase1/final.pt \
+    --p2-ckpt checkpoints/gazebo/phase2/final.pt
+```
+
+**Source:** [`LocalPrecisionGazeboPolicy.py`](./aic_example_policies/ros/LocalPrecisionGazeboPolicy.py)
+
+See the full [Gazebo Training Workflow](../docs/local_precision_workflow.md#gazebo-based-training-no-mujoco-required) for step-by-step instructions.
+
+---
+
 ## Scoring Examples
 
 For expected scoring results and reproducible test commands for each policy, see the [Scoring Test & Evaluation Guide](../../docs/scoring_tests.md).
