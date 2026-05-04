@@ -82,24 +82,13 @@ jobs:
       # ── Find SDF file Gazebo was started with ────────────────────────────────
       - name: Export world SDF from Gazebo
         run: |
-          docker exec aic_eval bash -c \
-            "ps aux | grep -o -- '-f [^ ]*\.sdf' | head -5 || \
-             ps aux | grep -o '[^ ]*\.sdf' | grep -v grep | head -5 || \
-             true"
-          SDF_PATH=$(docker exec aic_eval bash -c \
-            "ps aux | grep -o '[^ ]*\.sdf' | grep -v grep | head -1")
+          SDF_PATH=$(docker exec aic_eval bash -c "ps aux | grep -o '[^ ]*\.sdf' | grep -v grep | head -1")
           echo "Gazebo SDF path: $SDF_PATH"
           docker exec aic_eval ls -lh "$SDF_PATH"
           docker cp "aic_eval:$SDF_PATH" /tmp/aic.sdf
           head -c 300 /tmp/aic.sdf
-          python3 -c "
-import sys
-c = open('/tmp/aic.sdf').read(100).strip()
-if not c.startswith('<'):
-    print('ERROR: not XML:', repr(c[:200]))
-    sys.exit(1)
-print('SDF OK, size:', len(open('/tmp/aic.sdf').read()), 'bytes')
-"
+          head -c 1 /tmp/aic.sdf | grep -q '<' || (echo "ERROR: SDF does not start with XML" && exit 1)
+          echo "SDF OK — $(wc -c < /tmp/aic.sdf) bytes"
           docker cp /tmp/aic.sdf aic_eval:/tmp/aic.sdf
 
       # ── Fix known SDF URI issues ──────────────────────────────────────────
