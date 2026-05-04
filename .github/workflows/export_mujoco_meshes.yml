@@ -85,15 +85,12 @@ jobs:
           docker exec aic_eval bash -c \
             "source /opt/ros/kilted/setup.bash && \
              source /ws_aic/install/setup.bash && \
-             gz service --list 2>&1 | grep -i sdf || true"
-          docker exec aic_eval bash -c \
-            "source /opt/ros/kilted/setup.bash && \
-             source /ws_aic/install/setup.bash && \
              gz service \
                -s /world/aic/generate_world_sdf \
                --reqtype gz.msgs.WorldGeneratorParams \
                --reptype gz.msgs.StringMsg \
                --timeout 30000 \
+               --req '{}' \
              | python3 /tmp/parse_sdf.py"
           docker exec aic_eval ls -lh /tmp/aic.sdf
           docker exec aic_eval head -c 300 /tmp/aic.sdf
