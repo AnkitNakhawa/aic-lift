@@ -79,21 +79,28 @@ jobs:
           echo "--- Last 30 lines of container log ---"
           docker logs aic_eval 2>&1 | tail -30
 
-      # ── Export SDF via gz service ─────────────────────────────────────────
+      # ── Find SDF file Gazebo was started with ────────────────────────────────
       - name: Export world SDF from Gazebo
         run: |
           docker exec aic_eval bash -c \
-            "source /opt/ros/kilted/setup.bash && \
-             source /ws_aic/install/setup.bash && \
-             gz service \
-               -s /world/aic/generate_world_sdf \
-               --reqtype gz.msgs.WorldGeneratorParams \
-               --reptype gz.msgs.StringMsg \
-               --timeout 30000 \
-               --req '{}' \
-             | python3 /tmp/parse_sdf.py"
-          docker exec aic_eval ls -lh /tmp/aic.sdf
-          docker exec aic_eval head -c 300 /tmp/aic.sdf
+            "ps aux | grep -o -- '-f [^ ]*\.sdf' | head -5 || \
+             ps aux | grep -o '[^ ]*\.sdf' | grep -v grep | head -5 || \
+             true"
+          SDF_PATH=$(docker exec aic_eval bash -c \
+            "ps aux | grep -o '[^ ]*\.sdf' | grep -v grep | head -1")
+          echo "Gazebo SDF path: $SDF_PATH"
+          docker exec aic_eval ls -lh "$SDF_PATH"
+          docker cp "aic_eval:$SDF_PATH" /tmp/aic.sdf
+          head -c 300 /tmp/aic.sdf
+          python3 -c "
+import sys
+c = open('/tmp/aic.sdf').read(100).strip()
+if not c.startswith('<'):
+    print('ERROR: not XML:', repr(c[:200]))
+    sys.exit(1)
+print('SDF OK, size:', len(open('/tmp/aic.sdf').read()), 'bytes')
+"
+          docker cp /tmp/aic.sdf aic_eval:/tmp/aic.sdf
 
       # ── Fix known SDF URI issues ──────────────────────────────────────────
       - name: Fix SDF URI issues
