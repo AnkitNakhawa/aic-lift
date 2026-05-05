@@ -63,6 +63,31 @@ jobs:
           docker exec aic_eval bash -c \
             "cd /tmp/sdformat_mjcf && python3 setup.py install 2>&1 | tail -10"
 
+          # The aic branch source has mesh_io.py (.glb→.obj) and updated utils that
+          # setup.py does not install (it picks up an older egg). Overwrite in-place.
+          docker exec aic_eval bash -c "
+            SRC=/tmp/sdformat_mjcf/src/sdformat_mjcf
+            DST=\$(python3 -c 'import sdformat_mjcf; import os; print(os.path.dirname(sdformat_mjcf.__file__))')
+            cp -r \$SRC/sdformat_to_mjcf/mesh_io.py        \$DST/sdformat_to_mjcf/
+            cp -r \$SRC/sdformat_to_mjcf/converters/        \$DST/sdformat_to_mjcf/
+            cp -r \$SRC/sdformat_to_mjcf/sdformat_to_mjcf.py \$DST/sdformat_to_mjcf/
+            cp -r \$SRC/sdformat_to_mjcf/sdf_kinematics.py   \$DST/sdformat_to_mjcf/
+            cp -r \$SRC/utils/                               \$DST/
+          "
+
+          # The aic branch still references sdformat13 and gz.math7 by old names.
+          # The container ships these as 'sdformat' and 'gz.math' — patch all .py files.
+          docker exec aic_eval bash -c "
+            DST=\$(python3 -c 'import sdformat_mjcf; import os; print(os.path.dirname(sdformat_mjcf.__file__))')
+            find \$DST -name '*.py' | xargs sed -i \
+              's/from sdformat13 /from sdformat /g
+               s/import sdformat13/import sdformat/g
+               s/gz\.math7/gz.math/g
+               s/gz\.math8/gz.math/g
+               s/gz\.math9/gz.math/g'
+            find \$DST -name '*.pyc' -delete
+          "
+
           # Verify install succeeded and sdf2mjcf CLI is on PATH
           docker exec aic_eval python3 -c "import sdformat_mjcf; print('sdformat_mjcf OK')"
           docker exec aic_eval which sdf2mjcf
@@ -99,7 +124,8 @@ jobs:
              ASSETS=/ws_aic/install/share/aic_assets/models && \
              sed -i \"s|file:///sc_plug_visual|file://\${ASSETS}/SC Plug/sc_plug_visual|g\" /tmp/aic.sdf && \
              sed -i \"s|file:///lc_plug_visual|file://\${ASSETS}/LC Plug/lc_plug_visual|g\" /tmp/aic.sdf && \
-             sed -i \"s|file:///sfp_module_visual|file://\${ASSETS}/SFP Module/sfp_module_visual|g\" /tmp/aic.sdf"
+             sed -i \"s|file:///sfp_module_visual|file://\${ASSETS}/SFP Module/sfp_module_visual|g\" /tmp/aic.sdf && \
+             sed -i 's|<uri>file://\([^<]*\)</uri>|<uri>\1</uri>|g' /tmp/aic.sdf"
 
       # ── Convert SDF → MJCF + mesh assets ─────────────────────────────────
       - name: Convert SDF to MJCF
