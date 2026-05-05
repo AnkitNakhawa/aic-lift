@@ -7,8 +7,9 @@ Usage:
         --total_steps 500000 \\
         --save_dir checkpoints/phase2
 
-The Phase 2 policy consumes all 3 cameras + F/T sensor to guide descent.
-The detection auxiliary loss uses only the center camera's projected port center.
+No cameras. Observation is 86-D flat proprio.
+Curriculum ramps XY offset from 0 → xy_offset_max over the first
+curriculum_steps training steps (default 200k).
 """
 
 import argparse
@@ -19,78 +20,56 @@ import numpy as np
 import torch
 
 from .insertion_env import InsertionConfig, InsertionEnv
-from .image_utils import project_point_to_image, normalize_uv, IMG_SIZE
+from .networks import P2_OBS_DIM
 from .sac_trainer import ReplayBuffer, SACTrainer, DEVICE
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--scene", required=True, help="Path to scene.xml")
+    p.add_argument("--scene", required=True)
     p.add_argument("--port_type", default="sfp", choices=["sfp", "sc"])
     p.add_argument("--total_steps", type=int, default=500_000)
-    p.add_argument("--buffer_size", type=int, default=20_000)
+    p.add_argument("--buffer_size", type=int, default=100_000)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--warmup_steps", type=int, default=1_000)
     p.add_argument("--save_dir", default="checkpoints/phase2")
     p.add_argument("--save_interval", type=int, default=50_000)
     p.add_argument("--log_interval", type=int, default=1_000)
-    p.add_argument("--det_loss_weight", type=float, default=0.1)
+    p.add_argument("--xy_offset_max", type=float, default=0.005,
+                   help="Max XY curriculum offset at full difficulty (m)")
+    p.add_argument("--curriculum_steps", type=int, default=200_000,
+                   help="Steps over which XY offset ramps from 0 to xy_offset_max")
     p.add_argument("--load", default=None, help="Resume from checkpoint")
-    p.add_argument("--render_w", type=int, default=320)
-    p.add_argument("--render_h", type=int, default=240)
     return p.parse_args()
 
 
-def compute_gt_uv(env: InsertionEnv) -> np.ndarray:
-    """GT detection label from center camera."""
-    port_pos = env._get_port_pos()
-    cam_id = env._cam_ids["center"]
-    cam_xpos = env.data.cam_xpos[cam_id]
-    cam_xmat = env.data.cam_xmat[cam_id]
-    fovy = env.model.cam_fovy[cam_id]
-    W, H = env.cfg.render_width, env.cfg.render_height
-    u, v = project_point_to_image(port_pos, cam_xpos, cam_xmat, fovy, W, H)
-    return np.array(normalize_uv(u, v, W, H), dtype=np.float32)
-
-
-def _to_device_obs(obs: dict, device: torch.device) -> dict:
-    """Convert numpy obs dict to torch tensors (unbatched → add batch dim)."""
-    out = {}
-    for k, v in obs.items():
-        if k == "proprio":
-            out[k] = torch.from_numpy(v).unsqueeze(0).float().to(device)
-        else:
-            # image: H×W×C → 1×C×H×W float [0,1]
-            t = (
-                torch.from_numpy(v.transpose(2, 0, 1)).unsqueeze(0).float().to(device)
-                / 255.0
-            )
-            out[k] = t
-    return out
+def _to_device_obs(obs: np.ndarray, device: torch.device) -> dict:
+    """Phase 2: obs is a flat (86,) ndarray → {'proprio': (1, 86) tensor}."""
+    return {"proprio": torch.from_numpy(obs).unsqueeze(0).float().to(device)}
 
 
 def main():
     args = parse_args()
 
+    if not torch.cuda.is_available():
+        print("WARNING: CUDA not available — training on CPU will be slow.")
+    else:
+        print(f"Training on GPU: {torch.cuda.get_device_name(0)}")
+
     cfg = InsertionConfig(
         scene_path=args.scene,
         port_type=args.port_type,
-        render_width=args.render_w,
-        render_height=args.render_h,
+        xy_offset_max=args.xy_offset_max,
+        xy_offset_curriculum=0.0,  # starts at perfect alignment
     )
     env = InsertionEnv(cfg)
 
     buffer = ReplayBuffer(
         capacity=args.buffer_size,
         phase=2,
-        img_shape=(IMG_SIZE, IMG_SIZE, 4),
-        proprio_dim=13,
+        proprio_dim=P2_OBS_DIM,
     )
-    trainer = SACTrainer(
-        phase=2,
-        det_loss_weight=args.det_loss_weight,
-        device=DEVICE,
-    )
+    trainer = SACTrainer(phase=2, device=DEVICE)
     if args.load:
         trainer.load(args.load)
         print(f"Resumed from {args.load} (step {trainer._train_steps})")
@@ -105,9 +84,15 @@ def main():
     loss_log: dict = {}
     t0 = time.time()
 
-    print(f"Training Phase 2 on {DEVICE}. Total steps: {args.total_steps}")
+    print(f"Phase 2 training. Proprio dim={P2_OBS_DIM}. Device={DEVICE}. "
+          f"Total steps={args.total_steps}")
 
     while total_steps < args.total_steps:
+        # ── Curriculum update ──────────────────────────────────────────────
+        curriculum_frac = min(1.0, total_steps / max(1, args.curriculum_steps))
+        env.cfg.xy_offset_curriculum = curriculum_frac
+
+        # ── Action selection ───────────────────────────────────────────────
         if total_steps < args.warmup_steps:
             action = env.action_space.sample()
         else:
@@ -117,8 +102,7 @@ def main():
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        gt_uv = compute_gt_uv(env)
-        buffer.add(obs, action, reward, next_obs, float(done), gt_uv=gt_uv)
+        buffer.add(obs, action, reward, next_obs, float(done))
         obs = next_obs
         episode_reward += reward
         total_steps += 1
@@ -140,8 +124,8 @@ def main():
                 f"mean_r={mean_r:+7.2f} "
                 f"critic={loss_log.get('critic_loss', 0):.4f} "
                 f"actor={loss_log.get('actor_loss', 0):.4f} "
-                f"det={loss_log.get('det_loss', 0):.4f} "
                 f"alpha={loss_log.get('alpha', 0):.3f} "
+                f"curriculum={curriculum_frac:.2f} "
                 f"fps={total_steps / elapsed:.0f}"
             )
 

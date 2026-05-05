@@ -1,23 +1,21 @@
-"""Custom SAC trainer with auxiliary port detection head.
+"""Custom SAC trainer.
 
-Replay buffer stores images as uint8 for memory efficiency.
-The detection auxiliary loss backpropagates through the actor's CNN encoder,
-encouraging the CNN to learn spatially grounded port representations.
+Phase 1: image + proprio replay buffer, auxiliary detection loss.
+Phase 2: proprio-only replay buffer (no images), no detection loss.
+         Much smaller memory footprint; can use a large buffer cheaply.
 """
 
 from __future__ import annotations
 
 import copy
 import os
-from collections import deque
-from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from .networks import SACActor, SACCritic, P1_ACTION_DIM, P2_ACTION_DIM
+from .networks import SACActor, SACCritic, P1_ACTION_DIM, P2_ACTION_DIM, P2_OBS_DIM
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -26,36 +24,46 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class ReplayBuffer:
-    """Circular replay buffer that stores images as uint8 to save memory.
+    """Circular replay buffer.
 
-    Phase 1: images have key 'image' (1 camera).
-    Phase 2: images have keys 'center', 'left', 'right' (3 cameras).
+    Phase 1: stores images (uint8) + proprio.
+    Phase 2: stores proprio only (no images) — large buffers are cheap.
     """
 
     def __init__(
-        self, capacity: int, phase: int, img_shape=(84, 84, 4), proprio_dim: int = 7
+        self,
+        capacity: int,
+        phase: int,
+        img_shape=(84, 84, 4),
+        proprio_dim: int = 7,
     ):
         self.capacity = capacity
         self.phase = phase
         self.proprio_dim = proprio_dim
         self.action_dim = P1_ACTION_DIM if phase == 1 else P2_ACTION_DIM
 
-        cam_keys = ["image"] if phase == 1 else ["center", "left", "right"]
-        self._cam_keys = cam_keys
+        # Phase 1: 1 camera ("image"); Phase 2: no cameras
+        self._cam_keys = ["image"] if phase == 1 else []
 
-        # Pre-allocate numpy arrays (uint8 for images)
-        self._images = {
-            k: np.zeros((capacity, *img_shape), dtype=np.uint8) for k in cam_keys
-        }
-        self._images_next = {
-            k: np.zeros((capacity, *img_shape), dtype=np.uint8) for k in cam_keys
-        }
+        if self._cam_keys:
+            self._images = {
+                k: np.zeros((capacity, *img_shape), dtype=np.uint8)
+                for k in self._cam_keys
+            }
+            self._images_next = {
+                k: np.zeros((capacity, *img_shape), dtype=np.uint8)
+                for k in self._cam_keys
+            }
+        else:
+            self._images = {}
+            self._images_next = {}
+
         self._proprios = np.zeros((capacity, proprio_dim), dtype=np.float32)
         self._proprios_next = np.zeros((capacity, proprio_dim), dtype=np.float32)
         self._actions = np.zeros((capacity, self.action_dim), dtype=np.float32)
         self._rewards = np.zeros((capacity, 1), dtype=np.float32)
         self._dones = np.zeros((capacity, 1), dtype=np.float32)
-        # Per-transition GT detection labels (u,v) in [-1,1]; NaN if unavailable
+        # GT detection labels only used in phase 1
         self._gt_uvs = np.full((capacity, 2), np.nan, dtype=np.float32)
 
         self._ptr = 0
@@ -63,19 +71,25 @@ class ReplayBuffer:
 
     def add(
         self,
-        obs: dict,
+        obs: dict | np.ndarray,
         action: np.ndarray,
         reward: float,
-        next_obs: dict,
+        next_obs: dict | np.ndarray,
         done: bool,
         gt_uv: np.ndarray | None = None,
     ) -> None:
         i = self._ptr
-        for k in self._cam_keys:
-            self._images[k][i] = obs[k]
-            self._images_next[k][i] = next_obs[k]
-        self._proprios[i] = obs["proprio"]
-        self._proprios_next[i] = next_obs["proprio"]
+        # Phase 2 obs is a flat np.ndarray; Phase 1 is a dict with images
+        if self.phase == 1:
+            for k in self._cam_keys:
+                self._images[k][i] = obs[k]
+                self._images_next[k][i] = next_obs[k]
+            self._proprios[i] = obs["proprio"]
+            self._proprios_next[i] = next_obs["proprio"]
+        else:
+            self._proprios[i] = obs
+            self._proprios_next[i] = next_obs
+
         self._actions[i] = action
         self._rewards[i] = reward
         self._dones[i] = float(done)
@@ -83,21 +97,30 @@ class ReplayBuffer:
         self._ptr = (i + 1) % self.capacity
         self._size = min(self._size + 1, self.capacity)
 
-    def sample(self, batch_size: int, device: torch.device) -> tuple[dict, ...]:
+    def sample(self, batch_size: int, device: torch.device) -> tuple:
         idx = np.random.randint(0, self._size, size=batch_size)
 
-        def _imgs(store):
-            return {k: _to_tensor(store[k][idx], device) for k in self._cam_keys}
+        if self.phase == 1:
+            obs = {
+                k: _to_tensor(self._images[k][idx], device)
+                for k in self._cam_keys
+            }
+            obs["proprio"] = _f(self._proprios[idx], device)
+            nxt = {
+                k: _to_tensor(self._images_next[k][idx], device)
+                for k in self._cam_keys
+            }
+            nxt["proprio"] = _f(self._proprios_next[idx], device)
+        else:
+            proprio_t = _f(self._proprios[idx], device)
+            proprio_next_t = _f(self._proprios_next[idx], device)
+            obs = {"proprio": proprio_t}
+            nxt = {"proprio": proprio_next_t}
 
-        obs = {**_imgs(self._images), "proprio": _f(self._proprios[idx], device)}
-        nxt = {
-            **_imgs(self._images_next),
-            "proprio": _f(self._proprios_next[idx], device),
-        }
         actions = _f(self._actions[idx], device)
         rewards = _f(self._rewards[idx], device)
         dones = _f(self._dones[idx], device)
-        gt_uvs = _f(self._gt_uvs[idx], device)  # (B, 2); rows may contain NaN
+        gt_uvs = _f(self._gt_uvs[idx], device)
         return obs, actions, rewards, nxt, dones, gt_uvs
 
     def __len__(self) -> int:
@@ -105,9 +128,7 @@ class ReplayBuffer:
 
 
 def _to_tensor(arr: np.ndarray, device: torch.device) -> torch.Tensor:
-    """Convert H×W×C uint8 numpy batch to B×C×H×W float [0,1] tensor."""
-    t = torch.from_numpy(arr).permute(0, 3, 1, 2).float().to(device) / 255.0
-    return t
+    return torch.from_numpy(arr).permute(0, 3, 1, 2).float().to(device) / 255.0
 
 
 def _f(arr: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -118,15 +139,10 @@ def _f(arr: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 class SACTrainer:
-    """Soft Actor-Critic with auxiliary port detection loss.
+    """Soft Actor-Critic.
 
-    Detection aux loss:
-        L_det = MSE(actor.detection_head(features), gt_uv)
-    where gt_uv is the projected port center in the center camera frame,
-    provided alongside the environment transition.
-
-    gt_uv should be a (2,) float32 array in [-1, 1] pixel coords,
-    or None to skip the detection loss for that transition.
+    Phase 1: includes auxiliary port detection loss (CNN-based).
+    Phase 2: standard SAC only, no detection loss (no cameras).
     """
 
     def __init__(
@@ -144,7 +160,8 @@ class SACTrainer:
         self.phase = phase
         self.gamma = gamma
         self.tau = tau
-        self.det_loss_weight = det_loss_weight
+        # det_loss only meaningful for phase 1
+        self.det_loss_weight = det_loss_weight if phase == 1 else 0.0
         self.device = device
 
         self.actor = SACActor(phase).to(device)
@@ -157,33 +174,19 @@ class SACTrainer:
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
         action_dim = P1_ACTION_DIM if phase == 1 else P2_ACTION_DIM
-        target_entropy = -float(action_dim)
         self.log_alpha = torch.tensor(
             np.log(alpha_init), requires_grad=True, device=device
         )
         self.alpha_opt = optim.Adam([self.log_alpha], lr=alpha_lr)
-        self.target_entropy = target_entropy
+        self.target_entropy = -float(action_dim)
 
         self._train_steps = 0
-
-    # ── Properties ─────────────────────────────────────────────────────────
 
     @property
     def alpha(self) -> torch.Tensor:
         return self.log_alpha.exp()
 
-    # ── Core update ────────────────────────────────────────────────────────
-
-    def update(
-        self,
-        buffer: ReplayBuffer,
-        batch_size: int = 256,
-    ) -> dict:
-        """One gradient step.  Returns dict of scalar losses for logging.
-
-        GT detection labels are pulled from the per-transition buffer entries.
-        Transitions without GT (NaN) are masked out of the detection loss.
-        """
+    def update(self, buffer: ReplayBuffer, batch_size: int = 256) -> dict:
         obs, actions, rewards, next_obs, dones, gt_uvs_batch = buffer.sample(
             batch_size, self.device
         )
@@ -203,24 +206,20 @@ class SACTrainer:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_opt.step()
 
-        # ── Actor + detection auxiliary update ─────────────────────────────
+        # ── Actor update ───────────────────────────────────────────────────
         new_actions, log_pi, det_uv = self.actor(obs)
         q1_pi, q2_pi = self.critic(obs, new_actions)
-        q_pi = torch.min(q1_pi, q2_pi)
+        actor_loss = (self.alpha.detach() * log_pi - torch.min(q1_pi, q2_pi)).mean()
 
-        actor_loss = (self.alpha.detach() * log_pi - q_pi).mean()
-
-        # Detection auxiliary loss — only on transitions with valid GT
-        valid_mask = ~torch.isnan(gt_uvs_batch).any(dim=1)
-        if valid_mask.any():
-            det_loss = F.mse_loss(det_uv[valid_mask], gt_uvs_batch[valid_mask])
-            total_actor_loss = actor_loss + self.det_loss_weight * det_loss
-        else:
-            det_loss = torch.tensor(0.0)
-            total_actor_loss = actor_loss
+        det_loss = torch.tensor(0.0, device=self.device)
+        if self.phase == 1 and self.det_loss_weight > 0:
+            valid_mask = ~torch.isnan(gt_uvs_batch).any(dim=1)
+            if valid_mask.any():
+                det_loss = F.mse_loss(det_uv[valid_mask], gt_uvs_batch[valid_mask])
+            actor_loss = actor_loss + self.det_loss_weight * det_loss
 
         self.actor_opt.zero_grad()
-        total_actor_loss.backward()
+        actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_opt.step()
 
@@ -230,7 +229,7 @@ class SACTrainer:
         alpha_loss.backward()
         self.alpha_opt.step()
 
-        # ── Soft update target critic ──────────────────────────────────────
+        # ── Soft target update ─────────────────────────────────────────────
         with torch.no_grad():
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
                 pt.data.copy_(self.tau * p.data + (1.0 - self.tau) * pt.data)
@@ -243,8 +242,6 @@ class SACTrainer:
             "alpha": float(self.alpha),
             "alpha_loss": float(alpha_loss),
         }
-
-    # ── Checkpointing ──────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

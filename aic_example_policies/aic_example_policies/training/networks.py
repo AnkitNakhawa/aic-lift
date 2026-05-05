@@ -11,21 +11,25 @@ from torch.distributions import Normal
 P1_OBS_DIM = 135
 P1_ACTION_DIM = 2  # (dx, dy)
 
-# Phase 2 (insertion): 3-camera CNN (3×128=384) + xyz_rel (3) + ft (6)
-#                      + port_type_onehot (2) + step_norm (1) + depth (1) = 397
-P2_OBS_DIM = 397
-P2_ACTION_DIM = 3  # (dx, dy, dz)
+# Phase 2 (insertion): no cameras; flat proprioception only.
+# ft_history (12×6=72) + xyz_rel (3) + xyz_vel (3) + port_type (2)
+# + step_norm (1) + depth (1) + prev_action (3) + f_mag (1) = 86
+FT_HISTORY_LEN = 12
+P2_OBS_DIM = FT_HISTORY_LEN * 6 + 3 + 3 + 2 + 1 + 1 + 3 + 1  # = 86
+assert P2_OBS_DIM == 86
+P2_ACTION_DIM = 3  # (dx_res, dy_res, dz_res) — residuals on top of base descent
 
-# ── Action scales (meters per normalized unit) ──────────────────────────────
-XY_SCALE = 0.005  # Phase 1 lateral
-XY_INS_SCALE = 0.001  # Phase 2 lateral fine-tune
-Z_INS_SCALE = 0.002  # Phase 2 descent
+# ── Velocity/scale constants (must match training) ─────────────────────────
+XY_SCALE = 0.005        # Phase 1 lateral
+XY_INS_SCALE = 0.001    # Phase 2 lateral residual per normalized unit
+Z_INS_SCALE = 0.002     # Phase 2 Z residual per normalized unit
+BASE_VZ = 0.001         # m/step constant downward bias added before SAC residual
 
 LOG_STD_MIN = -5
 LOG_STD_MAX = 2
 
 
-# ── Building blocks ─────────────────────────────────────────────────────────
+# ── Building blocks (Phase 1 only) ─────────────────────────────────────────
 
 
 class SpatialSoftmax(nn.Module):
@@ -44,7 +48,6 @@ class SpatialSoftmax(nn.Module):
         self.height = height
         self.width = width
         self.temperature = nn.Parameter(torch.ones(1) * temperature, requires_grad=True)
-        # Pre-compute normalized grid coordinates in [-1, 1]
         xs = (
             torch.linspace(-1, 1, width)
             .view(1, 1, 1, width)
@@ -64,19 +67,18 @@ class SpatialSoftmax(nn.Module):
         B, C, H, W = x.shape
         flat = x.view(B, C, -1) / self.temperature
         weights = F.softmax(flat, dim=2).view(B, C, H, W)
-        ex = (weights * self.xs).sum(dim=(2, 3))  # (B, C)
-        ey = (weights * self.ys).sum(dim=(2, 3))  # (B, C)
+        ex = (weights * self.xs).sum(dim=(2, 3))
+        ey = (weights * self.ys).sum(dim=(2, 3))
         return torch.cat([ex, ey], dim=1)  # (B, 2*C)
 
 
 class CNNBackbone(nn.Module):
     """Small CNN: (B, 4, 84, 84) → (B, 128).
 
-    Architecture:
-        Conv(4→32, 8×8, s4) → ReLU   # 84 → 20
-        Conv(32→64, 4×4, s2) → ReLU  # 20 → 9
-        Conv(64→64, 3×3, s1) → ReLU  # 9 → 7
-        SpatialSoftmax(64, 7, 7)      # → 128
+    Conv(4→32, 8×8, s4) → ReLU   # 84 → 20
+    Conv(32→64, 4×4, s2) → ReLU  # 20 → 9
+    Conv(64→64, 3×3, s1) → ReLU  # 9 → 7
+    SpatialSoftmax(64, 7, 7)      # → 128
     """
 
     FEATURE_DIM = 128  # 64 channels × 2 (x + y expected positions)
@@ -106,7 +108,7 @@ class DetectionHead(nn.Module):
             nn.Linear(in_dim, 64),
             nn.ReLU(inplace=True),
             nn.Linear(64, 2),
-            nn.Tanh(),  # outputs in [-1, 1]
+            nn.Tanh(),
         )
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
@@ -117,30 +119,30 @@ class DetectionHead(nn.Module):
 
 
 class SACActor(nn.Module):
-    """Actor for Phase 1 or Phase 2.
-
-    phase=1: one center camera → 128-d features
-    phase=2: three cameras (center, left, right) → 3×128=384-d features
+    """Phase 1: one center camera + proprio → (dx, dy).
+    Phase 2: flat 86D proprio only → (dx_res, dy_res, dz_res).
     """
 
     def __init__(self, phase: int, hidden_dim: int = 256):
         super().__init__()
         assert phase in (1, 2)
         self.phase = phase
-        self.n_cameras = 1 if phase == 1 else 3
-        action_dim = P1_ACTION_DIM if phase == 1 else P2_ACTION_DIM
-        proprio_dim = (
-            P1_OBS_DIM - CNNBackbone.FEATURE_DIM
-            if phase == 1
-            else P2_OBS_DIM - 3 * CNNBackbone.FEATURE_DIM
-        )
 
-        self.encoders = nn.ModuleList([CNNBackbone() for _ in range(self.n_cameras)])
-        self.detection_head = DetectionHead()  # auxiliary; only used during training
+        if phase == 1:
+            self.n_cameras = 1
+            action_dim = P1_ACTION_DIM
+            self.encoders = nn.ModuleList([CNNBackbone()])
+            self.detection_head = DetectionHead()
+            mlp_in = P1_OBS_DIM  # 128 CNN features + 7 proprio = 135
+        else:
+            self.n_cameras = 0
+            action_dim = P2_ACTION_DIM
+            self.encoders = nn.ModuleList()
+            self.detection_head = None
+            mlp_in = P2_OBS_DIM  # 86 flat proprio, no cameras
 
-        cnn_out = self.n_cameras * CNNBackbone.FEATURE_DIM
         self.mlp = nn.Sequential(
-            nn.Linear(cnn_out + proprio_dim, hidden_dim),
+            nn.Linear(mlp_in, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
@@ -149,27 +151,22 @@ class SACActor(nn.Module):
         self.mean_head = nn.Linear(hidden_dim, action_dim)
         self.log_std_head = nn.Linear(hidden_dim, action_dim)
 
-    def _encode(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode images and return (cnn_features, det_head_output).
-
-        The detection head always operates on center-camera features.
-        For Phase 2, center features are computed once and reused.
-        """
-        if self.phase == 1:
-            center_feat = self.encoders[0](obs["image"])  # (B, 128)
-            feat = center_feat
-        else:
-            center_feat = self.encoders[0](obs["center"])  # (B, 128) — run once
-            left_feat = self.encoders[1](obs["left"])
-            right_feat = self.encoders[2](obs["right"])
-            feat = torch.cat([center_feat, left_feat, right_feat], dim=1)  # (B, 384)
-        det = self.detection_head(center_feat)
+    def _encode_p1(
+        self, obs: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        feat = self.encoders[0](obs["image"])  # (B, 128)
+        det = self.detection_head(feat)
         return feat, det
 
     def forward(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (action, log_prob, det_head_uv)."""
-        feat, det = self._encode(obs)
-        x = torch.cat([feat, obs["proprio"]], dim=1)
+        """Returns (action, log_prob, det_uv). det_uv is zeros for phase 2."""
+        if self.phase == 1:
+            feat, det = self._encode_p1(obs)
+            x = torch.cat([feat, obs["proprio"]], dim=1)
+        else:
+            x = obs["proprio"]
+            det = torch.zeros(x.shape[0], 2, device=x.device)
+
         h = self.mlp(x)
         mean = self.mean_head(h)
         log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
@@ -182,36 +179,39 @@ class SACActor(nn.Module):
 
     @torch.no_grad()
     def get_action(self, obs: dict) -> torch.Tensor:
-        feat, _ = self._encode(obs)
-        x = torch.cat([feat, obs["proprio"]], dim=1)
+        if self.phase == 1:
+            feat, _ = self._encode_p1(obs)
+            x = torch.cat([feat, obs["proprio"]], dim=1)
+        else:
+            x = obs["proprio"]
         h = self.mlp(x)
         mean = self.mean_head(h)
         log_std = self.log_std_head(h).clamp(LOG_STD_MIN, LOG_STD_MAX)
-        action = torch.tanh(Normal(mean, log_std.exp()).rsample())
-        return action
+        return torch.tanh(Normal(mean, log_std.exp()).rsample())
 
 
 # ── SAC Critic ──────────────────────────────────────────────────────────────
 
 
 class _QNet(nn.Module):
-    """Single Q-network with its own CNN encoder."""
+    """Single Q-network. Phase 1 uses CNNs; Phase 2 is a flat MLP."""
 
     def __init__(self, phase: int, hidden_dim: int = 256):
         super().__init__()
         self.phase = phase
-        self.n_cameras = 1 if phase == 1 else 3
         action_dim = P1_ACTION_DIM if phase == 1 else P2_ACTION_DIM
-        proprio_dim = (
-            P1_OBS_DIM - CNNBackbone.FEATURE_DIM
-            if phase == 1
-            else P2_OBS_DIM - 3 * CNNBackbone.FEATURE_DIM
-        )
-        cnn_out = self.n_cameras * CNNBackbone.FEATURE_DIM
 
-        self.encoders = nn.ModuleList([CNNBackbone() for _ in range(self.n_cameras)])
+        if phase == 1:
+            self.n_cameras = 1
+            self.encoders = nn.ModuleList([CNNBackbone()])
+            state_dim = P1_OBS_DIM
+        else:
+            self.n_cameras = 0
+            self.encoders = nn.ModuleList()
+            state_dim = P2_OBS_DIM
+
         self.net = nn.Sequential(
-            nn.Linear(cnn_out + proprio_dim + action_dim, hidden_dim),
+            nn.Linear(state_dim + action_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
@@ -222,18 +222,14 @@ class _QNet(nn.Module):
     def forward(self, obs: dict, action: torch.Tensor) -> torch.Tensor:
         if self.phase == 1:
             feat = self.encoders[0](obs["image"])
+            state = torch.cat([feat, obs["proprio"]], dim=1)
         else:
-            feats = [
-                enc(obs[k])
-                for enc, k in zip(self.encoders, ("center", "left", "right"))
-            ]
-            feat = torch.cat(feats, dim=1)
-        x = torch.cat([feat, obs["proprio"], action], dim=1)
-        return self.net(x)
+            state = obs["proprio"]
+        return self.net(torch.cat([state, action], dim=1))
 
 
 class SACCritic(nn.Module):
-    """Twin Q-networks (separate CNN encoders per Q-network)."""
+    """Twin Q-networks."""
 
     def __init__(self, phase: int, hidden_dim: int = 256):
         super().__init__()
