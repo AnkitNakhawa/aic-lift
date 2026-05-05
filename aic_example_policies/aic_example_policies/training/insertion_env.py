@@ -22,6 +22,7 @@ except ImportError as e:
 
 from .image_utils import (
     IMG_SIZE,
+    NARROW_CROP_PX,
     WIDE_CROP_PX,
     add_canny_channel,
     center_crop_and_resize,
@@ -57,7 +58,8 @@ class InsertionConfig:
     center_camera: str = "center_camera"
     left_camera: str = "left_camera"
     right_camera: str = "right_camera"
-    ft_sensor_name: str = "force_torque"  # sensor name in scene.xml — verify!
+    ft_force_sensor: str = "AtiForceTorqueSensor_force"   # 3-DOF force sensor name
+    ft_torque_sensor: str = "AtiForceTorqueSensor_torque"  # 3-DOF torque sensor name
     max_steps: int = 300
     xy_offset_range: tuple = (-0.003, 0.003)  # small residual offset at start
     z_start_offset: float = 0.005  # start just above port surface
@@ -106,7 +108,8 @@ class InsertionEnv(gym.Env):
             ),
         }
 
-        self._ft_sensor_adr = self._find_sensor_adr(config.ft_sensor_name)
+        self._ft_force_adr = self._find_sensor_adr(config.ft_force_sensor, dim=3)
+        self._ft_torque_adr = self._find_sensor_adr(config.ft_torque_sensor, dim=3)
         self._arm_joint_ids = self._resolve_joint_ids(config.arm_joint_names)
 
         port_type_enc = np.array(
@@ -133,9 +136,11 @@ class InsertionEnv(gym.Env):
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
-    def _find_sensor_adr(self, name: str) -> int:
+    def _find_sensor_adr(self, name: str, dim: int = 3) -> int:
         sid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, name)
-        return self.model.sensor_adr[sid] if sid >= 0 else -1
+        if sid < 0:
+            raise ValueError(f"Sensor '{name}' not found in scene — check InsertionConfig.")
+        return self.model.sensor_adr[sid]
 
     def _resolve_joint_ids(self, names: list[str]) -> np.ndarray:
         ids = []
@@ -159,12 +164,12 @@ class InsertionEnv(gym.Env):
         return self._get_tcp_pos() + self._get_tcp_mat() @ self._tcp_to_tip
 
     def _get_ft(self) -> np.ndarray:
-        if self._ft_sensor_adr < 0 or self.model.nsensor == 0:
-            return np.zeros(6, dtype=np.float32)
-        raw = self.data.sensordata[self._ft_sensor_adr : self._ft_sensor_adr + 6].copy()
+        force = self.data.sensordata[self._ft_force_adr : self._ft_force_adr + 3]
+        torque = self.data.sensordata[self._ft_torque_adr : self._ft_torque_adr + 3]
+        raw = np.concatenate([force, torque]).astype(np.float32)
         if self._tare_ft is not None:
             raw -= self._tare_ft
-        return raw.astype(np.float32)
+        return raw
 
     def _apply_delta_ik(self, delta: np.ndarray) -> None:
         """Apply (dx, dy, dz) world-frame TCP delta via damped IK."""
@@ -175,18 +180,19 @@ class InsertionEnv(gym.Env):
         dq = J.T @ np.linalg.solve(J @ J.T + lam**2 * np.eye(3), delta)
         self.data.qpos[self._arm_joint_ids] += dq
 
-    def _render_camera(self, cam_id: int) -> np.ndarray:
+    def _render_camera(self, cam_id: int, half_crop: int = WIDE_CROP_PX) -> np.ndarray:
         self.renderer.update_scene(self.data, camera=cam_id)
         rgb = self.renderer.render()
         rgbc = add_canny_channel(rgb)
-        return center_crop_and_resize(rgbc, WIDE_CROP_PX)
+        return center_crop_and_resize(rgbc, half_crop)
 
     def _get_obs(self) -> dict:
-        imgs = {k: self._render_camera(v) for k, v in self._cam_ids.items()}
+        depth = float(self._start_tcp_pos[2] - self._get_tcp_pos()[2]) if self._start_tcp_pos is not None else 0.0
+        half_crop = NARROW_CROP_PX if depth > 0.005 else WIDE_CROP_PX
+        imgs = {k: self._render_camera(v, half_crop) for k, v in self._cam_ids.items()}
         tcp_pos = self._get_tcp_pos()
         xyz_rel = (tcp_pos - self._start_tcp_pos).astype(np.float32)
         ft = self._get_ft()
-        depth = float(self._start_tcp_pos[2] - tcp_pos[2])  # positive = descended
         step_norm = np.float32(self._step / self.cfg.max_steps)
         proprio = np.concatenate(
             [xyz_rel, ft, self._port_type_enc, [step_norm], [depth]]
