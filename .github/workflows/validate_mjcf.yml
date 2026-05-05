@@ -1,0 +1,45 @@
+name: Validate MJCF assets
+
+# Runs on any PR that touches MJCF XMLs or the bundle version file.
+# Performs a structural check (no mesh files needed) to catch stale
+# hash references before they're merged.
+#
+# Full MuJoCo load validation is done inside the export_mujoco_meshes workflow
+# where mesh files are actually present.
+
+on:
+  pull_request:
+    paths:
+      - 'aic_utils/aic_mujoco/mjcf/*.xml'
+      - 'aic_utils/aic_mujoco/mjcf/ASSET_BUNDLE_VERSION'
+  push:
+    branches:
+      - main
+    paths:
+      - 'aic_utils/aic_mujoco/mjcf/*.xml'
+      - 'aic_utils/aic_mujoco/mjcf/ASSET_BUNDLE_VERSION'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate-mjcf:
+    name: validate-mjcf
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Structural-only check: verifies ASSET_BUNDLE_VERSION exists and that
+      # all hash prefixes embedded in the XML tree are self-consistent.
+      # Mesh files are gitignored so we skip the MuJoCo load here.
+      - name: Check MJCF structure (xml-only)
+        run: |
+          python3 scripts/check_mjcf_assets.py --xml-only

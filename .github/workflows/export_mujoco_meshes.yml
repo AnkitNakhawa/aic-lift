@@ -10,6 +10,10 @@ defaults:
   run:
     shell: bash
 
+permissions:
+  contents: write   # push sync branch
+  pull-requests: write  # open automated PR
+
 jobs:
   export-meshes:
     runs-on: ubuntu-24.04
@@ -147,6 +151,93 @@ jobs:
           cd /tmp/aic_mujoco_world
           zip -r /tmp/mujoco_mesh_assets.zip . --exclude '*.xml'
           ls -lh /tmp/mujoco_mesh_assets.zip
+
+      # ── Compute ASSET_BUNDLE_VERSION ──────────────────────────────────────
+      # A single 16-char hash of all mesh file contents, committed alongside
+      # the XMLs so CI can detect when they got out of sync.
+      - name: Compute ASSET_BUNDLE_VERSION
+        run: |
+          # Derive version from the set of asset hash-prefixes embedded in the
+          # generated XML — the same formula used by check_mjcf_assets.py and
+          # validate_mjcf.yml.  This way a version bump is always a one-line
+          # change to a single file, and CI can verify it without the mesh files.
+          BUNDLE=$(python3 - <<'PYEOF'
+          import re, hashlib
+          from pathlib import Path
+          prefixes = set()
+          for xml in Path("/tmp/aic_mujoco_world").glob("*.xml"):
+              for m in re.finditer(r'file="([0-9a-f]{64})_', xml.read_text()):
+                  prefixes.add(m.group(1))
+          print(hashlib.sha256("|".join(sorted(prefixes)).encode()).hexdigest()[:16])
+          PYEOF
+          )
+          echo "$BUNDLE" > /tmp/ASSET_BUNDLE_VERSION
+          echo "Bundle version: $BUNDLE"
+
+      # ── Validate with MuJoCo ──────────────────────────────────────────────
+      # Catches broken asset references before the artifact is declared ready.
+      - name: Validate scene loads with MuJoCo
+        run: |
+          pip install "mujoco==3.5.0" --quiet
+          python3 - <<'EOF'
+          import mujoco, sys, os
+          os.chdir("/tmp/aic_mujoco_world")
+          try:
+              m = mujoco.MjModel.from_xml_path("aic_world.xml")
+              print(f"MuJoCo OK: nbody={m.nbody}  ngeom={m.ngeom}  nsensor={m.nsensor}")
+          except Exception as e:
+              print(f"MuJoCo FAILED: {e}", file=sys.stderr)
+              sys.exit(1)
+          EOF
+
+      # ── Commit XMLs + version back to repo ───────────────────────────────
+      # Opens a PR so the XML and mesh bundle are always updated together.
+      - name: Commit XMLs and ASSET_BUNDLE_VERSION
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BUNDLE=$(cat /tmp/ASSET_BUNDLE_VERSION)
+          BRANCH="chore/mjcf-sync-${BUNDLE}"
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git fetch origin
+          git checkout -B "$BRANCH" origin/main
+
+          # Copy the generated XML and version file
+          cp /tmp/aic_mujoco_world/aic_world.xml   aic_utils/aic_mujoco/mjcf/aic_world.xml
+          cp /tmp/ASSET_BUNDLE_VERSION              aic_utils/aic_mujoco/mjcf/ASSET_BUNDLE_VERSION
+
+          git add aic_utils/aic_mujoco/mjcf/aic_world.xml \
+                  aic_utils/aic_mujoco/mjcf/ASSET_BUNDLE_VERSION
+
+          if git diff --cached --quiet; then
+            echo "XMLs unchanged — no PR needed."
+          else
+            TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            git commit -m "chore: sync MJCF XMLs + ASSET_BUNDLE_VERSION (bundle=${BUNDLE})
+
+          Exported from aic_eval docker image at ${TIMESTAMP}.
+          MuJoCo load validated (aic_world.xml) before commit."
+
+            git push --force-with-lease origin "$BRANCH"
+
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: sync MJCF XMLs (bundle=${BUNDLE})" \
+              --body "Automated PR from the 'Export MuJoCo Mesh Assets' workflow.
+
+          **What changed:** \`aic_world.xml\` and \`ASSET_BUNDLE_VERSION\` were regenerated
+          from the \`aic_eval\` Docker image and validated with MuJoCo before this PR was opened.
+
+          **Merge this PR together with downloading the matching mesh artifact** into
+          \`aic_utils/aic_mujoco/mjcf/\` so the XML and mesh files stay in sync.
+
+          Bundle version: \`${BUNDLE}\`
+          Exported at: \`${TIMESTAMP}\`" \
+              --label "automated" 2>/dev/null || echo "PR already exists for this bundle."
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
