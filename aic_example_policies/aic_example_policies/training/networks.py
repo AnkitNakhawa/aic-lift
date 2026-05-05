@@ -49,11 +49,13 @@ class SpatialSoftmax(nn.Module):
             torch.linspace(-1, 1, width)
             .view(1, 1, 1, width)
             .expand(1, channels, height, width)
+            .clone()
         )
         ys = (
             torch.linspace(-1, 1, height)
             .view(1, 1, height, 1)
             .expand(1, channels, height, width)
+            .clone()
         )
         self.register_buffer("xs", xs)
         self.register_buffer("ys", ys)

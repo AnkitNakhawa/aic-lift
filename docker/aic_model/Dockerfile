@@ -13,6 +13,7 @@ COPY pixi.toml pixi.lock /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
 
 # Add other dependencies
+COPY checkpoints/phase1/final.pt /ws_aic/src/aic/checkpoints/phase1/final.pt
 
 SHELL ["/bin/bash", "-c"]
 RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
@@ -57,4 +58,4 @@ exec pixi run --as-is ros2 run aic_model aic_model "$@"
 EOF
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode", "-p", "use_sim_time:=true"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.LocalPrecisionPolicy", "-p", "use_sim_time:=true"]

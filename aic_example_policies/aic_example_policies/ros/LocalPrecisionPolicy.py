@@ -364,6 +364,16 @@ class LocalPrecisionPolicy(Policy):
             [1.0, 0.0] if port_type == "sfp" else [0.0, 1.0], dtype=np.float32
         )
 
+        # Wait for first observation
+        self.get_logger().info("Waiting for first observation...")
+        for _ in range(100):
+            if get_observation() is not None:
+                break
+            time.sleep(0.1)
+        else:
+            self.get_logger().error("Timed out waiting for observations — aborting")
+            return False
+
         # Phase 0: orient gripper
         send_feedback("Phase 0: orienting")
         self._orient_step(get_observation, move_robot, port_type)
