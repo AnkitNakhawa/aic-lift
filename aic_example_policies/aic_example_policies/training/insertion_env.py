@@ -51,8 +51,8 @@ _FORCE_LIMIT = 30.0  # N — terminate episode (too dangerous)
 class InsertionConfig:
     scene_path: str
     port_type: str = "sfp"
-    sfp_port_body: str = "sfp_port_0"  # verify!
-    sc_port_body: str = "sc_port_0"  # verify!
+    sfp_port_body: str = "sfp_port_0_link"  # actual name in generated scene.xml
+    sc_port_body: str = "sc_port_0_link"  # actual name in generated scene.xml
     tcp_site: str = "gripper_tcp"
     center_camera: str = "center_camera"
     left_camera: str = "left_camera"

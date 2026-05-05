@@ -58,8 +58,8 @@ _SC_TCP_TO_TIP = np.array([0.0, 0.015385, -0.04045])
 class CenteringConfig:
     scene_path: str
     port_type: str = "sfp"  # "sfp" or "sc"
-    sfp_port_body: str = "sfp_port_0"  # body name in scene.xml — verify!
-    sc_port_body: str = "sc_port_0"  # body name in scene.xml — verify!
+    sfp_port_body: str = "sfp_port_0_link"  # body name in scene.xml
+    sc_port_body: str = "sc_port_0_link"  # body name in scene.xml
     tcp_site: str = "gripper_tcp"  # site name in scene.xml
     center_camera: str = "center_camera"
     max_steps: int = 200
