@@ -1,5 +1,38 @@
 # LocalPrecisionPolicy — Script Workflow
 
+## Connecting to Your GCP VM
+
+**One-time: install gcloud on your Mac**
+```bash
+brew install --cask google-cloud-sdk
+gcloud init        # pick your project and default zone
+gcloud auth login  # opens browser to sign in
+```
+
+**SSH in:**
+```bash
+gcloud compute instances list                                    # find name + zone
+gcloud compute ssh aic-lift --zone northamerica-northeast2-a
+```
+
+**First time on a new VM — check disk space:**
+```bash
+df -h   # /dev/nvme0n1p1 should be ≥ 50 GB
+```
+
+If the root partition is too small (default ~10 GB), resize it from your Mac:
+```bash
+gcloud compute disks resize aic-lift --size=50GB --zone northamerica-northeast2-a
+```
+Then on the VM:
+```bash
+sudo apt-get install -y cloud-guest-utils
+sudo growpart /dev/nvme0n1 1
+sudo resize2fs /dev/nvme0n1p1
+```
+
+---
+
 ## Stage 0 — Machine Setup *(run once, ever)*
 
 **`setup_cloud.sh`**
@@ -38,13 +71,65 @@ The venv lives in `~/.venvs/` — nothing inside the repo is touched. The `deplo
 
 ---
 
+## Stage 0b — Copy Mesh Assets to the VM
+
+The `.stl`, `.obj`, and `.png` mesh files in `aic_utils/aic_mujoco/mjcf/` are gitignored and must be copied separately. Run this from your **Mac terminal**:
+
+```bash
+gcloud compute scp \
+    /path/to/aic-lift/aic_utils/aic_mujoco/mjcf/*.stl \
+    /path/to/aic-lift/aic_utils/aic_mujoco/mjcf/*.obj \
+    /path/to/aic-lift/aic_utils/aic_mujoco/mjcf/*.png \
+    aic-lift:~/aic-lift/aic_utils/aic_mujoco/mjcf/ \
+    --zone northamerica-northeast2-a
+```
+
+Verify on the VM:
+```bash
+pixi run python -c "
+import mujoco
+m = mujoco.MjModel.from_xml_path('aic_utils/aic_mujoco/mjcf/scene.xml')
+print('Model OK — bodies:', m.nbody, 'joints:', m.njnt, 'sensors:', m.nsensor)
+"
+```
+
+---
+
+## Stage 0c — Headless Rendering
+
+The VM has no display, so MuJoCo can't open a window. Setting `MUJOCO_GL=egl` tells MuJoCo to use EGL for offscreen rendering instead of trying to connect to an X11 display. On this VM the EGL backend is provided by Mesa (`50_mesa.json`) — no NVIDIA driver or GPU is required for this to work.
+
+Install the Mesa EGL libraries (one-time):
+```bash
+sudo apt-get install -y libegl1 libegl-mesa0
+```
+
+Set the env var and make it permanent:
+```bash
+echo 'export MUJOCO_GL=egl' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Verify it works by loading the scene without a renderer:
+```bash
+pixi run python -c "
+import mujoco
+m = mujoco.MjModel.from_xml_path('aic_utils/aic_mujoco/mjcf/scene.xml')
+print('Model OK — bodies:', m.nbody, 'joints:', m.njnt, 'sensors:', m.nsensor)
+"
+```
+
+---
+
 ## Stage 1 — Training *(no eval container needed)*
 
-Both phases train entirely in MuJoCo headlessly — no Docker required.
+Both phases train entirely in MuJoCo headlessly — no Docker required. Training spawns a MuJoCo sim, resets it thousands of times, and runs SAC (Soft Actor-Critic) RL to learn a control policy. `MUJOCO_GL=egl` must be set so MuJoCo can render camera observations offscreen without a display.
 
 ### Phase 1 — XY Centering
 
 **`run_local_precision.sh train-p1`**
+
+Phase 1 teaches the robot to center the plug over the port using visual feedback from the wrist camera. It randomizes the XY starting offset each episode and trains a policy to correct it in as few steps as possible.
 
 | | |
 |---|---|
@@ -54,6 +139,7 @@ Both phases train entirely in MuJoCo headlessly — no Docker required.
 | **Physics** | Kinematic IK only (fast) |
 
 ```bash
+export MUJOCO_GL=egl
 ./scripts/run_local_precision.sh train-p1 \
     --scene aic_utils/aic_mujoco/mjcf/scene.xml \
     --total_steps 500000 \
@@ -64,6 +150,8 @@ Both phases train entirely in MuJoCo headlessly — no Docker required.
 
 **`run_local_precision.sh train-p2`**
 
+Phase 2 teaches the robot to descend and insert the plug once it is centered. It uses three cameras plus a 6-DOF force/torque sensor — the F/T signal tells the policy when the plug is making contact and whether it's misaligned.
+
 | | |
 |---|---|
 | **Input** | `scene.xml` + centered start pose (Phase 1 assumed complete) |
@@ -72,6 +160,7 @@ Both phases train entirely in MuJoCo headlessly — no Docker required.
 | **Physics** | Full `mj_step` with 5 substeps — cable contact forces matter |
 
 ```bash
+export MUJOCO_GL=egl
 ./scripts/run_local_precision.sh train-p2 \
     --scene aic_utils/aic_mujoco/mjcf/scene.xml \
     --total_steps 500000 \
@@ -112,16 +201,18 @@ Checkpoints save every 50k steps to `checkpoints/phaseN/step_N.pt`.
 
 **`run_local_precision.sh test`**
 
-Loads a checkpoint, runs N full episodes in MuJoCo sim, and prints per-episode stats. Use this to validate a checkpoint before deploying.
+Loads a checkpoint, runs N full episodes in MuJoCo sim, and prints per-episode stats. Each episode resets the scene, runs the policy until termination or timeout, and reports reward, step count, and task-specific metrics. Use this to validate a checkpoint before deploying to the real eval environment. `MUJOCO_GL=egl` is required so the renderer can produce camera observations without a display.
 
 ```bash
 # Test Phase 1
+export MUJOCO_GL=egl
 ./scripts/run_local_precision.sh test \
     --scene aic_utils/aic_mujoco/mjcf/scene.xml \
     --phase 1 \
     --ckpt checkpoints/phase1/final.pt
 
 # Test Phase 2
+export MUJOCO_GL=egl
 ./scripts/run_local_precision.sh test \
     --scene aic_utils/aic_mujoco/mjcf/scene.xml \
     --phase 2 \
@@ -129,12 +220,23 @@ Loads a checkpoint, runs N full episodes in MuJoCo sim, and prints per-episode s
     --episodes 5
 ```
 
+**Example output (Phase 1):**
+```
+Loaded checkpoint: checkpoints/phase1/final.pt
+  ep  1: reward=  +9.80  steps=  3  xy_err=0.0024m
+  ep  2: reward=  +9.42  steps=  5  xy_err=0.0026m
+  ep  3: reward=  +9.47  steps=  5  xy_err=0.0017m
+
+Mean reward over 3 episodes: +9.56
+```
+
 **What good output looks like:**
 
 | Phase | Signal | Target |
 |---|---|---|
-| Phase 1 | `xy_err` | < 0.004 m by step ~100 |
-| Phase 1 | `reward` | Trending toward 0 |
+| Phase 1 | `xy_err` | < 0.004 m |
+| Phase 1 | `steps` | Low (3–10) means fast convergence |
+| Phase 1 | `reward` | ~+9 to +10 |
 | Phase 2 | `depth` | > 0.015 m |
 | Phase 2 | `ft_mag` | < 10 N |
 | Phase 2 | `reward` | > +40 |
@@ -143,6 +245,12 @@ Loads a checkpoint, runs N full episodes in MuJoCo sim, and prints per-episode s
 
 ## Stage 3 — Live Deployment *(eval container must be running)*
 
+Deployment uses three terminals running simultaneously on the VM. SSH in three separate times:
+
+```bash
+gcloud compute ssh aic-lift --zone northamerica-northeast2-a
+```
+
 ### Terminal 1 — Start the eval environment
 
 **`start_eval.sh`**
@@ -150,10 +258,9 @@ Loads a checkpoint, runs N full episodes in MuJoCo sim, and prints per-episode s
 ```bash
 # Default: headless, ground_truth=true, sfp+sc cable
 ./scripts/start_eval.sh
-
-# With options
-./scripts/start_eval.sh ground_truth:=false gazebo_gui:=true launch_rviz:=true
 ```
+
+Wait until you see `No node with name 'aic_model' found. Retrying...` before starting the policy.
 
 Leave this running — it is the simulator Docker container.
 
@@ -179,22 +286,40 @@ The policy runs three phases in sequence: **Orient → Center (P1) → Insert (P
 ./scripts/run_policy.sh aic_example_policies.ros.LocalPrecisionPolicy
 ```
 
+### Terminal 3 — Monitor distance to goal *(optional)*
+
+```bash
+pixi run python scripts/watch_goal_distance.py
+```
+
+Streams the robot TCP's distance to the goal in real time:
+```
+[1234.567] dist=  12.34mm  rot=0.0023rad  xyz=(+8.1, -9.4, +3.2)mm
+```
+
+> This only produces output when the eval container is running **and** `start_aic_engine:=true` is set (or a policy is actively publishing to `/aic_controller/controller_state`).
+
 ---
 
 ## Full Training Run — Recommended Order
 
 ```
-1.  ./scripts/setup_cloud.sh               ← once per machine
-2.  source ~/.bashrc
-3.  run_local_precision.sh train-p1        ← overnight if needed
-4.  run_local_precision.sh test --phase 1
+1.  gcloud compute ssh aic-lift --zone northamerica-northeast2-a
+2.  ./scripts/setup_cloud.sh                        ← once per machine
+3.  sudo apt-get install -y libegl1 libegl-mesa0    ← once per machine
+4.  echo 'export MUJOCO_GL=egl' >> ~/.bashrc        ← once per machine
+5.  source ~/.bashrc
+6.  (copy mesh assets via gcloud compute scp — see Stage 0b)
+7.  run_local_precision.sh train-p1                 ← overnight if needed
+8.  run_local_precision.sh test --phase 1
         xy_err < 4 mm? ──► proceed
         still high?    ──► more steps or tune reward
-5.  run_local_precision.sh train-p2        ← overnight
-6.  run_local_precision.sh test --phase 2
+9.  run_local_precision.sh train-p2                 ← overnight
+10. run_local_precision.sh test --phase 2
         depth > 15 mm and ft_mag < 10 N? ──► proceed
-7.  start_eval.sh                          ← Terminal 1
-8.  run_local_precision.sh deploy          ← Terminal 2
+11. start_eval.sh                                   ← Terminal 1
+12. run_local_precision.sh deploy                   ← Terminal 2
+13. pixi run python scripts/watch_goal_distance.py  ← Terminal 3 (optional)
 ```
 
 ---
@@ -230,7 +355,7 @@ Same as the MuJoCo workflow (`setup_cloud.sh`).
 
 ```bash
 # ground_truth:=true is required so TF port poses are available for reward
-./scripts/start_eval.sh ground_truth:=true start_aic_engine:=false gazebo_gui:=false
+./scripts/start_eval.sh ground_truth:=true start_aic_engine:=false
 ```
 
 Leave this running for the entire training session.
